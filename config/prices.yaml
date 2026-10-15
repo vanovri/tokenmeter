@@ -1,0 +1,24 @@
+# prices.yaml - public LIST prices, USD per 1M tokens. Retrieved 2026-10-14.
+# NOTE: 9Router / Antigravity routes may be free or subscription-billed, so cost
+# computed here is a "list-price equivalent", not what you actually pay.
+# Keys are the REQUESTED model id (what the client sent), not the model name the
+# upstream reports back (9Router may report xai/grok-code-fast-1 as grok-build-0.1).
+# Cost = prompt*input/per + completion*output/per; if prompt_tokens >= long_context.threshold
+# the long_context rates apply to all tokens. cached_input is recorded for reference only
+# (TokenMeter does not yet track cached tokens separately). null => cost NULL (unpriced).
+currency: USD
+per: 1000000   # tokens
+models:
+  # Source: https://docs.x.ai/docs/models (Text API Pricing table), retrieved 2026-10-14
+  xai/grok-4.6:
+    {input: 2.00, output: 6.00, cached_input: 0.50,
+     long_context: {threshold: 200000, input: 4.00, output: 12.00, cached_input: 1.00}}
+  # Source: https://docs.x.ai/docs/models/grok-code-fast-1 , retrieved 2026-10-14.
+  # grok-code-fast-1 is an official alias of grok-build-0.1; priced as listed there.
+  xai/grok-code-fast-1:
+    {input: 1.00, output: 2.00, cached_input: 0.20,
+     long_context: {threshold: 200000, input: 2.00, output: 4.00, cached_input: 0.40}}
+  # Source: https://ai.google.dev/gemini-api/docs/pricing (gemini-3.8-flash, Standard, Paid tier),
+  # retrieved 2026-10-14. Valid through 2026-12-31; from 2027-01-01 list price doubles
+  # to input 1.50 / output 7.50 / cached 0.15 -> update this file then.
+  ag/gemini-3.8-flash:   {input: 0.75, output: 3.75, cached_input: 0.075}

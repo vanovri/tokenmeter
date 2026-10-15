@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+tokenmeter.db
+tokenmeter.db.bak-*
+logs/
+*.err.log
+*.out.log
+.env
+.env.*
+
+config/prices.yaml.bak-*
