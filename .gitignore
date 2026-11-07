@@ -11,3 +11,6 @@ logs/
 .env.*
 
 config/prices.yaml.bak-*
+
+graphify-out/
+
