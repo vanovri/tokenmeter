@@ -120,3 +120,7 @@ Push-Location C:\Users\ardhy\Projects\tokenmeter
 .\.venv\Scripts\python.exe -m pytest -q
 Pop-Location
 ```
+
+## Source crosscheck, 2026-11-08
+
+Source descriptions and proposal removed-lines were crosschecked on 2026-11-08. Test commands are retained for reproduction. Historical test counts are not a fresh run result. 

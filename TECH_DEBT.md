@@ -1,10 +1,10 @@
 # TokenMeter — Technical Debt & Performance Ledger
 
-All items below are verified against the current repository source files on disk with exact 1-based line numbers. Production code has not been speculatively modified.
+Source crosscheck: 2026-11-08 WIB. The locations and removed lines match current source. Diffs are independent proposals, not applied changes or measured speedups.
 
 ---
 
-## 1. Quadratic $O(L^2)$ Byte-Buffer Slicing on Multi-Line SSE Chunks in `SSEStreamScanner.feed()`
+## 1. Repeated Byte-Buffer Tail Copying on Multi-Line SSE Chunks in `SSEStreamScanner.feed()`
 
 - **Location**: `tokenmeter/proxy.py` (lines `320-326`)
 - **Category**: Streaming Allocation & CPU Efficiency
@@ -80,3 +80,5 @@ Run `C:\Python314\python.exe -m pytest -q`.
 
 ### Verification
 Run `C:\Python314\python.exe -m pytest -q`.
+
+The SSE change improves coalesced-line scanning, but a very long line fragmented across many chunks still repeatedly concatenates immutable bytes. It is not a full bounded-memory streaming redesign. Wildcard ties must retain the first matching insertion-order rule, as the strict greater-than rank comparison does.
