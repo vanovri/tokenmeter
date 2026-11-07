@@ -1,220 +1,730 @@
 """TokenMeter: OpenAI-compatible logging proxy. Never logs/stores API keys."""
-import os, re, json, time, datetime, logging
+from __future__ import annotations
+
+import asyncio
+import datetime
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import time
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, TypedDict
+
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
 from . import db as dbm
+from . import otel as otelm
 from .prices import Prices
 
-log = logging.getLogger("tokenmeter")
-HOP = {"x-tokenmeter-project","x-tokenmeter-tags","host","content-length","connection","transfer-encoding","accept-encoding","x-tokenmeter-tag","x-client"}
+log = logging.getLogger(__name__)
 
-def redact(s):
-    if s is None: return None
-    s = str(s)
-    for k in ("NINEROUTER_API_KEY","OPENAI_API_KEY"):
-        v = os.environ.get(k)
-        if v and len(v) > 4: s = s.replace(v, "[REDACTED]")
-    import re
-    s = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+", r"\1[REDACTED]", s)
-    s = re.sub(r"sk-[A-Za-z0-9._\-]{6,}", "[REDACTED]", s)
-    return s[:2000]
+HOP: frozenset[str] = frozenset(
+    {
+        "x-tokenmeter-project",
+        "x-tokenmeter-tags",
+        "host",
+        "content-length",
+        "connection",
+        "transfer-encoding",
+        "accept-encoding",
+        "x-tokenmeter-tag",
+        "x-client",
+    }
+)
 
-def parse_tags(h):
+_RE_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+")
+_RE_SK_KEY = re.compile(r"sk-[A-Za-z0-9._\-]{6,}")
+_RE_TAG_SPLIT = re.compile(r"[;,]")
+
+TagPair = tuple[str, str | None]
+
+
+class UsageInfo(TypedDict):
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cached_tokens: int | None
+    reasoning_tokens: int | None
+    audio_input_tokens: int | None
+    audio_output_tokens: int | None
+
+
+def _empty_usage() -> UsageInfo:
+    return {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "cached_tokens": None,
+        "reasoning_tokens": None,
+        "audio_input_tokens": None,
+        "audio_output_tokens": None,
+    }
+
+
+def _valid_nonneg_int(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, float):
+        if not math.isfinite(val) or not val.is_integer():
+            return None
+        val = int(val)
+    elif not isinstance(val, int):
+        return None
+    return val if val >= 0 else None
+
+
+def redact(s: Any) -> str | None:
+    if s is None:
+        return None
+    text = str(s)
+    for env_key in ("NINEROUTER_API_KEY", "OPENAI_API_KEY"):
+        secret = os.environ.get(env_key)
+        if secret and len(secret) > 4:
+            text = text.replace(secret, "[REDACTED]")
+    text = _RE_BEARER.sub(r"\1[REDACTED]", text)
+    text = _RE_SK_KEY.sub("[REDACTED]", text)
+    return text[:2000]
+
+
+def parse_tags(h: str | None) -> list[TagPair]:
     """'k=v; k2=v2' or 'k=v,k2=v2' -> [(k, v), ...]. Bare words become (word, None)."""
-    out = []
-    for part in re.split(r"[;,]", h or ""):
-        part = part.strip()
-        if not part: continue
-        k, _, v = part.partition("=")
-        out.append((k.strip()[:100], (v.strip()[:500] or None) if _ else None))
-    return out[:50]
-
-def estimate_tokens(x) -> int:
-    """Rough local estimate (~4 chars/token, OpenAI rule of thumb). Only used when the
-    upstream sent no usage; rows are flagged usage_source='estimated'."""
-    if x is None: return 0
-    if not isinstance(x, str):
-        x = " ".join(str(m.get("content") or "") if isinstance(m, dict) else str(m) for m in x)
-    return max(1, -(-len(x) // 4)) if x else 0
-
-def parse_body(content: bytes) -> dict:
-    """Parse a non-stream body leniently: plain JSON, JSON followed by extra data,
-    or SSE-framed chunks (some routers send these). Returns the merged usage/error info."""
-    text = content.decode("utf-8", "replace").strip()
-    dec = json.JSONDecoder()
-    if not text.startswith("data:"):
-        try: return dec.raw_decode(text)[0]
-        except Exception: pass
-    out = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("data:"): line = line[5:].strip()
-        if not line or line == "[DONE]": continue
-        try: j = dec.raw_decode(line)[0]
-        except Exception: continue
-        if isinstance(j, dict):
-            if j.get("usage"): out["usage"] = j["usage"]
-            if j.get("error"): out["error"] = j["error"]
+    if not h:
+        return []
+    out: list[TagPair] = []
+    for raw_part in _RE_TAG_SPLIT.split(h):
+        part = raw_part.strip()
+        if not part:
+            continue
+        k, sep, v = part.partition("=")
+        key_clean = k.strip()[:100]
+        if not key_clean:
+            continue
+        val_clean = (v.strip()[:500] or None) if sep else None
+        out.append((key_clean, val_clean))
+        if len(out) >= 50:
+            break
     return out
 
-def create_app(upstream=None, db_path=None, prices_path=None, transport=None):
-    upstream = (upstream or os.environ.get("TOKENMETER_UPSTREAM", "http://127.0.0.1:20128/v1")).rstrip("/")
-    db_path = db_path or os.environ.get("TOKENMETER_DB", "tokenmeter.db")
-    prices_path = prices_path or os.environ.get("TOKENMETER_PRICES", os.path.join(os.path.dirname(__file__), "..", "config", "prices.yaml"))
-    conn = dbm.connect(db_path)
-    prices = Prices(prices_path, conn)
-    client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=10), transport=transport)
-    app = FastAPI(title="TokenMeter")
-    from . import otel as otelm
-    otel = otelm.from_env()
-    app.state.conn, app.state.prices, app.state.otel = conn, prices, otel
 
-    def fwd_headers(req: Request):
-        h = {k: v for k, v in req.headers.items() if k.lower() not in HOP}
-        ph = os.environ.get("TOKENMETER_REPLACE_AUTH")
-        if ph:  # client sent the agreed local placeholder -> substitute the real key below
-            h = {k: v for k, v in h.items() if not (k.lower() == "authorization" and v.strip() == f"Bearer {ph}")}
-        if "authorization" not in {k.lower() for k in h}:
-            key = os.environ.get("NINEROUTER_API_KEY")
-            if key: h["Authorization"] = f"Bearer {key}"
-        return h
+def _message_text(msg: Any) -> str:
+    if isinstance(msg, Mapping):
+        content = msg.get("content")
+        if isinstance(content, list):
+            parts = [
+                str(item.get("text") or "") if isinstance(item, Mapping) else str(item)
+                for item in content
+            ]
+            return " ".join(p for p in parts if p)
+        return str(content or "")
+    return str(msg)
 
-    def record(total=None, upstream=None, tags=None, **r):
-        r["total_ms"] = total
-        r["upstream_ms"] = round(upstream, 1) if upstream is not None else None
-        r["overhead_ms"] = round(max(total - upstream, 0.0), 2) if total is not None and upstream is not None else None
-        r["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        r["error"] = redact(r.get("error"))
-        r["cost"] = prices.cost(r.get("model"), r.get("prompt_tokens"), r.get("completion_tokens"))
-        r["price_version"] = prices.version
-        try: dbm.insert(conn, r, tags)
-        except Exception as e: log.error("db insert failed: %s", type(e).__name__)
-        if otel is not None:
-            try: otel.emit(r, tags)
-            except Exception as e: log.error("otel emit failed: %s", type(e).__name__)
 
-    @app.get("/healthz")
-    async def health(): return {"ok": True, "upstream": upstream}
+def estimate_tokens(x: Any) -> int:
+    """Rough local estimate (~4 chars/token). Used only when upstream omits usage."""
+    if x is None:
+        return 0
+    if isinstance(x, str):
+        text = x
+    elif isinstance(x, Iterable):
+        text = " ".join(_message_text(m) for m in x)
+    else:
+        text = str(x)
+    return max(1, -(-len(text) // 4)) if text else 0
 
-    async def models(req: Request, project: str | None = None):
+
+def _extract_openai_or_anthropic_usage(u: Mapping[str, Any]) -> UsageInfo:
+    info = _empty_usage()
+    pt = _valid_nonneg_int(u.get("prompt_tokens"))
+    ct = _valid_nonneg_int(u.get("completion_tokens"))
+
+    if pt is not None or ct is not None:
+        info["prompt_tokens"] = pt
+        info["completion_tokens"] = ct
+        pt_details = u.get("prompt_tokens_details")
+        if isinstance(pt_details, Mapping):
+            info["cached_tokens"] = _valid_nonneg_int(pt_details.get("cached_tokens"))
+            info["audio_input_tokens"] = _valid_nonneg_int(pt_details.get("audio_tokens"))
+        ct_details = u.get("completion_tokens_details")
+        if isinstance(ct_details, Mapping):
+            info["reasoning_tokens"] = _valid_nonneg_int(ct_details.get("reasoning_tokens"))
+            info["audio_output_tokens"] = _valid_nonneg_int(ct_details.get("audio_tokens"))
+        return info
+
+    # Anthropic usage schema: input_tokens (+ optional cache_read_input_tokens / cache_creation_input_tokens), output_tokens
+    anth_in = _valid_nonneg_int(u.get("input_tokens"))
+    cache_read = _valid_nonneg_int(u.get("cache_read_input_tokens"))
+    cache_create = _valid_nonneg_int(u.get("cache_creation_input_tokens"))
+    anth_out = _valid_nonneg_int(u.get("output_tokens"))
+
+    if anth_in is not None or cache_read is not None or cache_create is not None:
+        info["prompt_tokens"] = (anth_in or 0) + (cache_read or 0) + (cache_create or 0)
+        info["cached_tokens"] = cache_read
+    if anth_out is not None:
+        info["completion_tokens"] = anth_out
+    return info
+
+
+def _extract_gemini_usage(meta: Mapping[str, Any]) -> UsageInfo:
+    info = _empty_usage()
+    pt = _valid_nonneg_int(meta.get("promptTokenCount"))
+    cand = _valid_nonneg_int(meta.get("candidatesTokenCount"))
+    thoughts = _valid_nonneg_int(meta.get("thoughtsTokenCount"))
+    cached = _valid_nonneg_int(meta.get("cachedContentTokenCount"))
+
+    info["prompt_tokens"] = pt
+    if cand is not None or thoughts is not None:
+        info["completion_tokens"] = (cand or 0) + (thoughts or 0)
+    info["cached_tokens"] = cached
+    info["reasoning_tokens"] = thoughts
+    return info
+
+
+def extract_usage(payload: Mapping[str, Any]) -> UsageInfo:
+    """Extract normalized token counts from OpenAI, Anthropic, or Gemini response payloads."""
+    if not isinstance(payload, Mapping):
+        return _empty_usage()
+
+    u = payload.get("usage")
+    if isinstance(u, Mapping):
+        extracted = _extract_openai_or_anthropic_usage(u)
+        if extracted["prompt_tokens"] is not None or extracted["completion_tokens"] is not None:
+            return extracted
+
+    msg = payload.get("message")
+    if isinstance(msg, Mapping) and isinstance(msg.get("usage"), Mapping):
+        extracted = _extract_openai_or_anthropic_usage(msg["usage"])
+        if extracted["prompt_tokens"] is not None or extracted["completion_tokens"] is not None:
+            return extracted
+
+    meta = payload.get("usageMetadata")
+    if isinstance(meta, Mapping):
+        return _extract_gemini_usage(meta)
+
+    return _empty_usage()
+
+
+def _merge_usage(target: UsageInfo, incoming: UsageInfo) -> None:
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "reasoning_tokens",
+        "audio_input_tokens",
+        "audio_output_tokens",
+    ):
+        val = incoming[key]  # type: ignore[literal-required]
+        if val is not None:
+            target[key] = val  # type: ignore[literal-required]
+
+
+def parse_body(content: bytes) -> dict[str, Any]:
+    """Parse a non-stream body leniently: plain JSON, JSON with trailing data, or SSE frames."""
+    text = content.decode("utf-8", "replace").strip()
+    if not text:
+        return {}
+    dec = json.JSONDecoder()
+    if not text.startswith("data:") and not text.startswith("event:"):
         try:
-            r = await client.get(upstream + "/models", headers=fwd_headers(req))
-        except httpx.HTTPError as e:
-            return JSONResponse({"error": {"message": f"upstream error: {type(e).__name__}"}}, 502)
-        return Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
+            parsed, _ = dec.raw_decode(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
 
-    async def chat(req: Request, project: str | None = None):
+    out: dict[str, Any] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]" or line.startswith(("event:", ":")):
+            continue
+        try:
+            frame, _ = dec.raw_decode(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(frame, dict):
+            if frame.get("usage"):
+                out["usage"] = frame["usage"]
+            if frame.get("usageMetadata"):
+                out["usageMetadata"] = frame["usageMetadata"]
+            if frame.get("error"):
+                out["error"] = frame["error"]
+    return out
+
+
+def _extract_delta_pieces(frame: Mapping[str, Any]) -> list[str]:
+    pieces: list[str] = []
+    # OpenAI choices[].delta
+    choices = frame.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            delta = choice.get("delta")
+            if not isinstance(delta, Mapping):
+                continue
+            piece = str(delta.get("content") or "") + str(delta.get("reasoning_content") or "")
+            if delta.get("tool_calls"):
+                piece += json.dumps(delta["tool_calls"])
+            if piece:
+                pieces.append(piece)
+
+    # Anthropic content_block_delta
+    anth_delta = frame.get("delta")
+    if isinstance(anth_delta, Mapping):
+        anth_piece = str(anth_delta.get("text") or "") + str(anth_delta.get("thinking") or "")
+        if anth_piece:
+            pieces.append(anth_piece)
+
+    # Gemini candidates[].content.parts[].text
+    candidates = frame.get("candidates")
+    if isinstance(candidates, list):
+        for cand in candidates:
+            if not isinstance(cand, Mapping):
+                continue
+            content = cand.get("content")
+            if not isinstance(content, Mapping):
+                continue
+            parts = content.get("parts")
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, Mapping) and part.get("text"):
+                        pieces.append(str(part["text"]))
+    return pieces
+
+
+@dataclass(slots=True)
+class SSEStreamScanner:
+    """Stateful byte-level SSE frame scanner safe across arbitrary multi-byte UTF-8 chunk splits."""
+
+    clock_ms: Callable[[], float]
+    ttft_ms: float | None = None
+    usage: UsageInfo = field(default_factory=_empty_usage)
+    error: str | None = None
+    buffer: bytes = b""
+    text_parts: list[str] = field(default_factory=list)
+
+    @property
+    def prompt_tokens(self) -> int | None:
+        return self.usage["prompt_tokens"]
+
+    @property
+    def completion_tokens(self) -> int | None:
+        return self.usage["completion_tokens"]
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.buffer += chunk
+        while b"\n" in self.buffer:
+            raw_line, self.buffer = self.buffer.split(b"\n", 1)
+            self._process_line(raw_line)
+
+    def flush(self) -> None:
+        if self.buffer:
+            self.feed(b"\n")
+
+    def _process_line(self, raw_line: bytes) -> None:
+        line = raw_line.strip()
+        if not line.startswith(b"data:"):
+            return
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            return
+        try:
+            frame = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(frame, Mapping):
+            return
+
+        for piece in _extract_delta_pieces(frame):
+            self.text_parts.append(piece)
+            if self.ttft_ms is None:
+                self.ttft_ms = self.clock_ms()
+
+        _merge_usage(self.usage, extract_usage(frame))
+        if frame.get("error"):
+            self.error = json.dumps(frame["error"])
+
+
+def build_forward_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    h = {k: v for k, v in headers.items() if k.lower() not in HOP}
+    placeholder = os.environ.get("TOKENMETER_REPLACE_AUTH")
+    if placeholder:
+        h = {
+            k: v
+            for k, v in h.items()
+            if not (k.lower() == "authorization" and v.strip() == f"Bearer {placeholder}")
+        }
+    if not any(k.lower() == "authorization" for k in h):
+        key = os.environ.get("NINEROUTER_API_KEY")
+        if key:
+            h["Authorization"] = f"Bearer {key}"
+    return h
+
+
+def _prepare_chat_body(raw: bytes) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if bool(parsed.get("stream")):
+        raw_so = parsed.get("stream_options")
+        so = dict(raw_so) if isinstance(raw_so, Mapping) else {}
+        so["include_usage"] = True
+        parsed["stream_options"] = so
+    return parsed
+
+
+@dataclass(slots=True)
+class _ProxyContext:
+    upstream: str
+    conn: sqlite3.Connection
+    prices: Prices
+    client: httpx.AsyncClient
+    otel: otelm.OTelEmitter | None
+
+    def record_sync(
+        self,
+        *,
+        total: float | None = None,
+        upstream_ms: float | None = None,
+        tags: list[TagPair] | None = None,
+        usage_details: UsageInfo | None = None,
+        **r: Any,
+    ) -> None:
+        r["total_ms"] = total
+        r["upstream_ms"] = round(upstream_ms, 1) if upstream_ms is not None else None
+        r["overhead_ms"] = (
+            round(max(total - upstream_ms, 0.0), 2)
+            if total is not None and upstream_ms is not None
+            else None
+        )
+        r["ts"] = datetime.datetime.now(datetime.UTC).isoformat()
+        r["error"] = redact(r.get("error"))
+        details = usage_details or _empty_usage()
+        r["cost"] = self.prices.cost(
+            r.get("model"),
+            r.get("prompt_tokens"),
+            r.get("completion_tokens"),
+            cached_tokens=details["cached_tokens"],
+            reasoning_tokens=details["reasoning_tokens"],
+            audio_input_tokens=details["audio_input_tokens"],
+            audio_output_tokens=details["audio_output_tokens"],
+        )
+        r["price_version"] = self.prices.version
+        try:
+            dbm.insert(self.conn, r, tags)
+        except (sqlite3.Error, ValueError, TypeError, OSError) as exc:
+            log.error("db insert failed: %s: %s", type(exc).__name__, exc)
+        if self.otel is not None:
+            try:
+                self.otel.emit(r, tags)
+            except (RuntimeError, ValueError, TypeError, OSError) as exc:
+                log.error("otel emit failed: %s: %s", type(exc).__name__, exc)
+
+    async def record_async(
+        self,
+        *,
+        total: float | None = None,
+        upstream_ms: float | None = None,
+        tags: list[TagPair] | None = None,
+        usage_details: UsageInfo | None = None,
+        **r: Any,
+    ) -> None:
+        try:
+            await asyncio.to_thread(
+                self.record_sync,
+                total=total,
+                upstream_ms=upstream_ms,
+                tags=tags,
+                usage_details=usage_details,
+                **r,
+            )
+        except RuntimeError:
+            self.record_sync(
+                total=total,
+                upstream_ms=upstream_ms,
+                tags=tags,
+                usage_details=usage_details,
+                **r,
+            )
+
+
+async def _handle_non_stream_chat(
+    ctx: _ProxyContext,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    base: dict[str, Any],
+    tags: list[TagPair],
+    clock_ms: Callable[[], float],
+) -> Response:
+    tu = time.perf_counter()
+    try:
+        r = await ctx.client.post(
+            f"{ctx.upstream}/chat/completions", json=body, headers=headers
+        )
+    except httpx.HTTPError as exc:
+        up_ms = (time.perf_counter() - tu) * 1000
+        await ctx.record_async(
+            **base,
+            tags=tags,
+            status_code=502,
+            error=f"{type(exc).__name__}: {exc}",
+            total=clock_ms(),
+            upstream_ms=up_ms,
+        )
+        return JSONResponse(
+            {"error": {"message": f"upstream error: {type(exc).__name__}"}},
+            status_code=502,
+        )
+
+    up_ms = (time.perf_counter() - tu) * 1000
+    parsed = parse_body(r.content)
+    usage = extract_usage(parsed)
+    pt, ct = usage["prompt_tokens"], usage["completion_tokens"]
+    src = "reported" if pt is not None else None
+    err: str | None = None
+    if r.status_code >= 400:
+        err = json.dumps(parsed["error"]) if "error" in parsed else (
+            json.dumps(parsed) if parsed else r.text
+        )
+
+    resp = Response(
+        r.content,
+        r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+    )
+    await ctx.record_async(
+        **base,
+        tags=tags,
+        status_code=r.status_code,
+        error=err,
+        prompt_tokens=pt,
+        completion_tokens=ct,
+        usage_source=src,
+        ttft_ms=None,
+        total=clock_ms(),
+        upstream_ms=up_ms,
+        usage_details=usage,
+    )
+    return resp
+
+
+async def _handle_stream_chat(
+    ctx: _ProxyContext,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    base: dict[str, Any],
+    tags: list[TagPair],
+    clock_ms: Callable[[], float],
+) -> Response:
+    tu = time.perf_counter()
+    try:
+        ureq = ctx.client.build_request(
+            "POST", f"{ctx.upstream}/chat/completions", json=body, headers=headers
+        )
+        r = await ctx.client.send(ureq, stream=True)
+    except httpx.HTTPError as exc:
+        up_ms = (time.perf_counter() - tu) * 1000
+        await ctx.record_async(
+            **base,
+            tags=tags,
+            status_code=502,
+            error=f"{type(exc).__name__}: {exc}",
+            total=clock_ms(),
+            upstream_ms=up_ms,
+        )
+        return JSONResponse(
+            {"error": {"message": f"upstream error: {type(exc).__name__}"}},
+            status_code=502,
+        )
+
+    if r.status_code >= 400:
+        content = await r.aread()
+        await r.aclose()
+        up_ms = (time.perf_counter() - tu) * 1000
+        await ctx.record_async(
+            **base,
+            tags=tags,
+            status_code=r.status_code,
+            error=content.decode("utf-8", "replace"),
+            total=clock_ms(),
+            upstream_ms=up_ms,
+        )
+        return Response(
+            content,
+            r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+
+    scanner = SSEStreamScanner(clock_ms=clock_ms)
+    upstream_wait_ms = (time.perf_counter() - tu) * 1000
+
+    async def gen() -> AsyncIterator[bytes]:
+        nonlocal upstream_wait_ms
+        it = r.aiter_raw().__aiter__()
+        try:
+            while True:
+                tw = time.perf_counter()
+                try:
+                    chunk = await it.__anext__()
+                except StopAsyncIteration:
+                    upstream_wait_ms += (time.perf_counter() - tw) * 1000
+                    break
+                upstream_wait_ms += (time.perf_counter() - tw) * 1000
+                scanner.feed(chunk)
+                yield chunk
+        except (httpx.HTTPError, OSError) as exc:
+            scanner.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            await r.aclose()
+            scanner.flush()
+            pt, ct = scanner.prompt_tokens, scanner.completion_tokens
+            src = "reported"
+            if pt is None:
+                pt = estimate_tokens(body.get("messages"))
+                ct = estimate_tokens("".join(scanner.text_parts))
+                src = "estimated"
+            await ctx.record_async(
+                **base,
+                tags=tags,
+                status_code=r.status_code,
+                error=scanner.error,
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                usage_source=src,
+                ttft_ms=scanner.ttft_ms,
+                total=clock_ms(),
+                upstream_ms=upstream_wait_ms,
+                usage_details=scanner.usage,
+            )
+
+    return StreamingResponse(
+        gen(),
+        r.status_code,
+        media_type=r.headers.get("content-type", "text/event-stream"),
+    )
+
+
+def create_app(
+    upstream: str | None = None,
+    db_path: str | os.PathLike[str] | None = None,
+    prices_path: str | os.PathLike[str] | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> FastAPI:
+    resolved_upstream = (
+        upstream or os.environ.get("TOKENMETER_UPSTREAM", "http://127.0.0.1:20128/v1")
+    ).rstrip("/")
+    resolved_db = os.fspath(db_path) if db_path is not None else os.environ.get(
+        "TOKENMETER_DB", "tokenmeter.db"
+    )
+    default_prices = os.path.join(os.path.dirname(__file__), "..", "config", "prices.yaml")
+    resolved_prices = (
+        os.fspath(prices_path)
+        if prices_path is not None
+        else os.environ.get("TOKENMETER_PRICES", default_prices)
+    )
+
+    conn = dbm.connect(resolved_db)
+    prices = Prices(resolved_prices, conn)
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300, connect=10),
+        transport=transport,
+    )
+    otel = otelm.from_env()
+    ctx = _ProxyContext(
+        upstream=resolved_upstream,
+        conn=conn,
+        prices=prices,
+        client=client,
+        otel=otel,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await client.aclose()
+            if otel is not None:
+                otel.shutdown()
+            conn.close()
+
+    fastapi_app = FastAPI(title="TokenMeter", lifespan=lifespan)
+    fastapi_app.state.conn = conn
+    fastapi_app.state.prices = prices
+    fastapi_app.state.otel = otel
+    fastapi_app.state.client = client
+
+    @fastapi_app.get("/healthz")
+    async def health() -> dict[str, Any]:
+        return {"ok": True, "upstream": resolved_upstream}
+
+    async def models(req: Request, project: str | None = None) -> Response:
+        _ = project
+        try:
+            r = await client.get(
+                f"{resolved_upstream}/models",
+                headers=build_forward_headers(req.headers),
+            )
+        except httpx.HTTPError as exc:
+            return JSONResponse(
+                {"error": {"message": f"upstream error: {type(exc).__name__}"}},
+                status_code=502,
+            )
+        return Response(
+            r.content,
+            r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+
+    async def chat(req: Request, project: str | None = None) -> Response:
         t0 = time.perf_counter()
-        ms = lambda: round((time.perf_counter() - t0) * 1000, 1)
+
+        def clock_ms() -> float:
+            return round((time.perf_counter() - t0) * 1000, 1)
+
         tag = req.headers.get("x-tokenmeter-tag") or req.headers.get("x-client")
-        project = project or req.headers.get("x-tokenmeter-project")
-        kv = parse_tags(req.headers.get("x-tokenmeter-tags"))
-        raw = await req.body()
-        try: body = json.loads(raw)
-        except Exception: return JSONResponse({"error": {"message": "invalid JSON"}}, 400)
-        model, stream = body.get("model"), bool(body.get("stream"))
-        base = dict(tag=tag, project=project, model=model, stream=int(stream), tags=kv)
-        if stream:
-            so = body.get("stream_options") or {}
-            so["include_usage"] = True
-            body["stream_options"] = so
-        headers = fwd_headers(req)
+        resolved_project = project or req.headers.get("x-tokenmeter-project")
+        kv_tags = parse_tags(req.headers.get("x-tokenmeter-tags"))
+
+        body = _prepare_chat_body(await req.body())
+        if body is None:
+            return JSONResponse({"error": {"message": "invalid JSON"}}, status_code=400)
+
+        raw_model = body.get("model")
+        model = str(raw_model) if raw_model is not None else None
+        stream = bool(body.get("stream"))
+        base = {
+            "tag": tag,
+            "project": resolved_project,
+            "model": model,
+            "stream": int(stream),
+        }
+        fwd = build_forward_headers(req.headers)
 
         if not stream:
-            tu = time.perf_counter()
-            try:
-                r = await client.post(upstream + "/chat/completions", json=body, headers=headers)
-            except httpx.HTTPError as e:
-                up = (time.perf_counter() - tu) * 1000
-                record(**base, status_code=502, error=f"{type(e).__name__}: {e}", total=ms(), upstream=up)
-                return JSONResponse({"error": {"message": f"upstream error: {type(e).__name__}"}}, 502)
-            up = (time.perf_counter() - tu) * 1000
-            pt = ct = None; err = None; src = None
-            try:
-                j = parse_body(r.content); u = j.get("usage") or {}
-                pt, ct = u.get("prompt_tokens"), u.get("completion_tokens")
-                src = "reported" if pt is not None else None
-                if r.status_code >= 400: err = json.dumps(j.get("error", j))
-            except Exception:
-                if r.status_code >= 400: err = r.text
-            resp = Response(r.content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
-            record(**base, status_code=r.status_code, error=err, prompt_tokens=pt, completion_tokens=ct,
-                   usage_source=src, ttft_ms=None, total=ms(), upstream=up)
-            return resp
+            return await _handle_non_stream_chat(ctx, body, fwd, base, kv_tags, clock_ms)
+        return await _handle_stream_chat(ctx, body, fwd, base, kv_tags, clock_ms)
 
-        tu = time.perf_counter()
-        try:
-            ureq = client.build_request("POST", upstream + "/chat/completions", json=body, headers=headers)
-            r = await client.send(ureq, stream=True)
-        except httpx.HTTPError as e:
-            up = (time.perf_counter() - tu) * 1000
-            record(**base, status_code=502, error=f"{type(e).__name__}: {e}", total=ms(), upstream=up)
-            return JSONResponse({"error": {"message": f"upstream error: {type(e).__name__}"}}, 502)
-        if r.status_code >= 400:
-            content = await r.aread(); await r.aclose()
-            up = (time.perf_counter() - tu) * 1000
-            record(**base, status_code=r.status_code, error=content.decode("utf-8", "replace"), total=ms(), upstream=up)
-            return Response(content, r.status_code, media_type=r.headers.get("content-type", "application/json"))
+    fastapi_app.add_api_route("/v1/models", models, methods=["GET"])
+    fastapi_app.add_api_route("/p/{project}/v1/models", models, methods=["GET"])
+    fastapi_app.add_api_route("/v1/chat/completions", chat, methods=["POST"])
+    fastapi_app.add_api_route("/p/{project}/v1/chat/completions", chat, methods=["POST"])
+    return fastapi_app
 
-        st = {"ttft": None, "pt": None, "ct": None, "err": None, "buf": b"", "text": [],
-              "up": (time.perf_counter() - tu) * 1000}
-        def scan(chunk: bytes):
-            st["buf"] += chunk
-            while b"\n" in st["buf"]:
-                line, st["buf"] = st["buf"].split(b"\n", 1)
-                line = line.strip()
-                if not line.startswith(b"data:"): continue
-                data = line[5:].strip()
-                if data == b"[DONE]": continue
-                try: j = json.loads(data)
-                except Exception: continue
-                for c in j.get("choices") or []:
-                    d = c.get("delta") or {}
-                    piece = (d.get("content") or "") + (d.get("reasoning_content") or "")
-                    if d.get("tool_calls"): piece += json.dumps(d["tool_calls"])
-                    if piece:
-                        st["text"].append(piece)
-                        if st["ttft"] is None: st["ttft"] = ms()
-                u = j.get("usage")
-                if u:
-                    st["pt"], st["ct"] = u.get("prompt_tokens"), u.get("completion_tokens")
-                if j.get("error"): st["err"] = json.dumps(j["error"])
 
-        async def gen():
-            it = r.aiter_raw().__aiter__()
-            try:
-                while True:
-                    tw = time.perf_counter()
-                    try: chunk = await it.__anext__()
-                    except StopAsyncIteration:
-                        st["up"] += (time.perf_counter() - tw) * 1000; break
-                    st["up"] += (time.perf_counter() - tw) * 1000   # time waiting on upstream
-                    scan(chunk); yield chunk
-            except Exception as e:
-                st["err"] = f"{type(e).__name__}: {e}"
-            finally:
-                await r.aclose()
-                scan(b"\n")
-                pt, ct, src = st["pt"], st["ct"], "reported"
-                if pt is None:   # upstream sent no usage: local estimate, flagged
-                    pt, ct, src = estimate_tokens(body.get("messages")), estimate_tokens("".join(st["text"])), "estimated"
-                record(**base, status_code=r.status_code, error=st["err"], prompt_tokens=pt,
-                       completion_tokens=ct, usage_source=src, ttft_ms=st["ttft"], total=ms(), upstream=st["up"])
-        return StreamingResponse(gen(), r.status_code, media_type=r.headers.get("content-type", "text/event-stream"))
+app: FastAPI | None = None
 
-    # /v1/... plus /p/{project}/v1/... so clients that can't set headers can still be tagged
-    app.add_api_route("/v1/models", models, methods=["GET"])
-    app.add_api_route("/p/{project}/v1/models", models, methods=["GET"])
-    app.add_api_route("/v1/chat/completions", chat, methods=["POST"])
-    app.add_api_route("/p/{project}/v1/chat/completions", chat, methods=["POST"])
 
-    @app.on_event("shutdown")
-    async def _close():
-        await client.aclose()
-        if otel is not None: otel.shutdown()
-    return app
-
-app = None
-def get_app():
+def get_app() -> FastAPI:
     return create_app()
