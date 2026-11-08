@@ -6,7 +6,7 @@ A Streamlit dashboard shows per-model calls, tokens, cost, p50/p95 latency, erro
 
 ## Setup (PowerShell)
 ```powershell
-cd C:\Users\ardhy\projects\tokenmeter
+cd .
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 ```

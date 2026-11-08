@@ -64,8 +64,8 @@
 .\.venv\Scripts\python.exe -m pytest --cov=tokenmeter --cov=dashboard --cov-report=term-missing
 
 # 2. Ruff Linter -> Exit Code: 0 (All checks passed!)
-C:\Users\ardhy\.gemini\antigravity\brain\7b19fb5e-cc47-425f-9713-ee64d56c8136\scratch\qa-tools\qa-venv\Scripts\ruff.exe check tokenmeter dashboard.py tests
+ruff check tokenmeter dashboard.py tests
 
 # 3. Mypy Type Checker -> Exit Code: 0 (Success: no issues found in 7 source files)
-C:\Users\ardhy\.gemini\antigravity\brain\7b19fb5e-cc47-425f-9713-ee64d56c8136\scratch\qa-tools\qa-venv\Scripts\mypy.exe tokenmeter dashboard.py --ignore-missing-imports
+mypy tokenmeter dashboard.py --ignore-missing-imports
 ```

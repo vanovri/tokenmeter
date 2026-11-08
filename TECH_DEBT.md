@@ -15,6 +15,7 @@ Source crosscheck: 2026-11-08 WIB. The locations and removed lines match current
 
 ### Proposed Patch (`diff`)
 ```diff
+diff --git a/tokenmeter/proxy.py b/tokenmeter/proxy.py
 --- a/tokenmeter/proxy.py
 +++ b/tokenmeter/proxy.py
 @@ -321,8 +321,11 @@
@@ -49,6 +50,7 @@ Run `C:\Python314\python.exe -m pytest -q`.
 
 ### Proposed Patch (`diff`)
 ```diff
+diff --git a/tokenmeter/prices.py b/tokenmeter/prices.py
 --- a/tokenmeter/prices.py
 +++ b/tokenmeter/prices.py
 @@ -96,16 +96,16 @@

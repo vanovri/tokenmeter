@@ -63,7 +63,7 @@ sequenceDiagram
         end
         Proxy->>Proxy: finally: aclose(), scan("\\n"), fallback estimate_tokens() if usage missing
         Proxy->>Prices: cost(requested_model, prompt_tokens, completion_tokens)
-        Prices->>Prices: reload() prices.yaml if SHA-256 changed; compute_cost()
+        Prices->>Prices: reload() prices.yaml if SHA-256 changed, compute_cost()
         Proxy->>DB: insert(requests row + tags rows)
         opt TOKENMETER_OTEL enabled
             Proxy->>OTel: emit("chat {model}" span without prompts/keys)
@@ -116,8 +116,7 @@ sequenceDiagram
 Run the complete `pytest` suite (including `httpx.ASGITransport` proxy tests, pricing recomputation, OTLP protobuf collector verification, Streamlit `AppTest` rendering, and audit boundary tests) using the repository virtual environment:
 
 ```powershell
-Push-Location C:\Users\ardhy\Projects\tokenmeter
-.\.venv\Scripts\python.exe -m pytest -q
+Push-Location python -m pytest -q
 Pop-Location
 ```
 
