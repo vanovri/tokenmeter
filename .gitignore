@@ -14,3 +14,5 @@ config/prices.yaml.bak-*
 
 graphify-out/
 
+*.db-shm
+*.db-wal
