@@ -112,7 +112,7 @@ def test_priced_cost_and_client_auth(env):
     )
     assert CALLS[0].headers["authorization"] == "Bearer client-key"
     assert rows(db)[0]["cost"] == pytest.approx((11 * 1 + 7 * 2) / 1e6)
-    assert rows(db)[0]["price_version"] is not None
+    assert isinstance(rows(db)[0]["price_version"], str) and len(rows(db)[0]["price_version"]) >= 8
 
 
 def test_stream(env):
